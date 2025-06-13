@@ -25,36 +25,54 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	exec "github.com/cch123/keyedexecutor"
+	"github.com/cch123/keyedexecutor"
 )
 
 func main() {
 	// Create a new executor with a maximum of 10 concurrent tasks
-	executor := exec.New[string](exec.Config{
+	exec := keyedexecutor.New[string](keyedexecutor.Config{
 		WorkerCount: 4,
 	})
 
 	// Execute a task with key "user1"
-	executor.ExecuteWithContext("user1", context.Background(), func(ctx context.Context) {
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "user", "user1")
+	exec.ExecuteWithContext("user1", ctx, func(ctx context.Context) {
 		fmt.Println("Processing task for user1")
 		time.Sleep(100 * time.Millisecond)
+		fmt.Println("Processing task for user1, read ctx value, User:", ctx.Value("user"))
 	})
 
 	// Tasks with the same key run sequentially
-	executor.Execute("user1", func() {
+	exec.Execute("user1", func() {
 		fmt.Println("Another task for user1, runs after the first one")
 	})
 
 	// Tasks with different keys can run in parallel
-	executor.ExecuteWithError("user2", func() error {
+	err := <-exec.ExecuteWithError("user2", func() error {
 		fmt.Println("Processing task for user2 (can run in parallel with user1 tasks)")
-		return nil
+		return errors.New("example error")
+	})
+	fmt.Println("err returned", err)
+
+	err = <-exec.ExecuteWithContextError("user3", ctx, func(ctx context.Context) error {
+		fmt.Println("Processing task for user3 (can run in parallel with user1 tasks)")
+
+		time.Sleep(200 * time.Millisecond)
+		fmt.Println("Processing task for user3, read ctx value, User:", ctx.Value("user"))
+		return errors.New("example error for user3")
 	})
 
-	fmt.Println(executor.Stats())
+	fmt.Println("err returned for user3", err)
+
+	fmt.Printf("executor stats ")
+	workerCount, pendingTasks := exec.Stats()
+	fmt.Println("worker count:", workerCount, "pending tasks:", pendingTasks)
+	time.Sleep(time.Second)
 }
 
 ```
@@ -76,16 +94,6 @@ executor.Execute(key string, task func(context.Context) error)
 
 // Execute a task with a specific key and context
 executor.ExecuteWithContext(ctx context.Context, key string, task func(context.Context) error)
-```
-
-### Waiting for Tasks to Complete
-
-```go
-// Wait for all tasks to complete
-executor.Wait()
-
-// Wait for all tasks to complete with a timeout
-executor.WaitWithTimeout(timeout time.Duration) error
 ```
 
 ## License
