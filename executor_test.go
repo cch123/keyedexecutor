@@ -173,3 +173,66 @@ func TestKeyedExecutor_Stats(t *testing.T) {
 		t.Errorf("Expected 0 pending tasks, got %d", pending)
 	}
 }
+
+func BenchmarkKeyedExecutor_SingleKey(b *testing.B) {
+	executor := New[string]()
+	defer executor.Shutdown()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		executor.Execute("single-key", func() {
+			close(done)
+		})
+		<-done
+	}
+}
+
+func BenchmarkKeyedExecutor_MultipleKeys(b *testing.B) {
+	executor := New[string]()
+	defer executor.Shutdown()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		counter := 0
+		for pb.Next() {
+			key := fmt.Sprintf("key-%d", counter%100)
+			counter++
+
+			done := make(chan struct{})
+			executor.Execute(key, func() {
+				close(done)
+			})
+			<-done
+		}
+	})
+}
+
+func BenchmarkKeyedExecutor_WithContext(b *testing.B) {
+	executor := New[string]()
+	defer executor.Shutdown()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		executor.ExecuteWithContext("context-key", ctx, func(ctx context.Context) {
+			close(done)
+		})
+		<-done
+	}
+}
+
+func BenchmarkKeyedExecutor_WithError(b *testing.B) {
+	executor := New[string]()
+	defer executor.Shutdown()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		errCh := executor.ExecuteWithError("error-key", func() error {
+			return nil
+		})
+		<-errCh
+	}
+}

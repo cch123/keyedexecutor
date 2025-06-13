@@ -96,6 +96,22 @@ executor.Execute(key string, task func(context.Context) error)
 executor.ExecuteWithContext(ctx context.Context, key string, task func(context.Context) error)
 ```
 
+## Benchmark
+
+```
+~/keyedExecutor ❯❯❯ go test -bench=.
+goos: darwin
+goarch: arm64
+pkg: github.com/cch123/keyedexecutor
+cpu: Apple M2 Max
+BenchmarkKeyedExecutor_SingleKey-12       	 2412008	       483.2 ns/op
+BenchmarkKeyedExecutor_MultipleKeys-12    	 2222204	       515.9 ns/op
+BenchmarkKeyedExecutor_WithContext-12     	 2425419	       494.1 ns/op
+BenchmarkKeyedExecutor_WithError-12       	 2445438	       490.5 ns/op
+PASS
+ok  	github.com/cch123/keyedexecutor	7.683s
+```
+
 ## License
 
 [MIT License](LICENSE)
