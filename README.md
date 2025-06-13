@@ -15,7 +15,7 @@ KeyedExecutor is a Go library for concurrent task execution with key-based group
 ## Installation
 
 ```bash
-go get github.com/yourusername/keyedexecutor
+go get github.com/cch123/keyedexecutor
 ```
 
 ## Usage
@@ -24,39 +24,39 @@ go get github.com/yourusername/keyedexecutor
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
+	"context"
+	"fmt"
+	"time"
 
-    "github.com/yourusername/keyedexecutor"
+	exec "github.com/cch123/keyedexecutor"
 )
 
 func main() {
-    // Create a new executor with a maximum of 10 concurrent tasks
-    executor := keyedexecutor.New(10)
+	// Create a new executor with a maximum of 10 concurrent tasks
+	executor := exec.New[string](exec.Config{
+		WorkerCount: 4,
+	})
 
-    // Execute a task with key "user1"
-    executor.Execute("user1", func(ctx context.Context) error {
-        fmt.Println("Processing task for user1")
-        time.Sleep(100 * time.Millisecond)
-        return nil
-    })
+	// Execute a task with key "user1"
+	executor.ExecuteWithContext("user1", context.Background(), func(ctx context.Context) {
+		fmt.Println("Processing task for user1")
+		time.Sleep(100 * time.Millisecond)
+	})
 
-    // Tasks with the same key run sequentially
-    executor.Execute("user1", func(ctx context.Context) error {
-        fmt.Println("Another task for user1, runs after the first one")
-        return nil
-    })
+	// Tasks with the same key run sequentially
+	executor.Execute("user1", func() {
+		fmt.Println("Another task for user1, runs after the first one")
+	})
 
-    // Tasks with different keys can run in parallel
-    executor.Execute("user2", func(ctx context.Context) error {
-        fmt.Println("Processing task for user2 (can run in parallel with user1 tasks)")
-        return nil
-    })
+	// Tasks with different keys can run in parallel
+	executor.ExecuteWithError("user2", func() error {
+		fmt.Println("Processing task for user2 (can run in parallel with user1 tasks)")
+		return nil
+	})
 
-    // Wait for all tasks to complete
-    executor.Wait()
+	fmt.Println(executor.Stats())
 }
+
 ```
 
 ## API Documentation
@@ -65,7 +65,7 @@ func main() {
 
 ```go
 // Create a new executor with a specified maximum number of concurrent tasks
-executor := keyedexecutor.New(maxConcurrency)
+executor := keyedexecutor.New[int](keyedexecutor.Config{100})
 ```
 
 ### Executing Tasks
