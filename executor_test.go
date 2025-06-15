@@ -10,7 +10,7 @@ import (
 )
 
 func TestKeyedExecutor_Execute(t *testing.T) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	var counter int
@@ -34,7 +34,7 @@ func TestKeyedExecutor_Execute(t *testing.T) {
 }
 
 func TestKeyedExecutor_ExecuteWithContext(t *testing.T) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -58,7 +58,7 @@ func TestKeyedExecutor_ExecuteWithContext(t *testing.T) {
 }
 
 func TestKeyedExecutor_ExecuteWithError(t *testing.T) {
-	executor := New[int]()
+	executor := New[int, int]()
 	defer executor.Shutdown()
 
 	expectedErr := errors.New("test error")
@@ -74,7 +74,7 @@ func TestKeyedExecutor_ExecuteWithError(t *testing.T) {
 }
 
 func TestKeyedExecutor_ExecuteWithContextError(t *testing.T) {
-	executor := New[int]()
+	executor := New[int, int]()
 	defer executor.Shutdown()
 
 	ctx := context.Background()
@@ -91,7 +91,7 @@ func TestKeyedExecutor_ExecuteWithContextError(t *testing.T) {
 }
 
 func TestKeyedExecutor_ConcurrentExecution(t *testing.T) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	var wg sync.WaitGroup
@@ -126,7 +126,7 @@ func TestKeyedExecutor_ConcurrentExecution(t *testing.T) {
 
 func TestKeyedExecutor_Stats(t *testing.T) {
 	cfg := Config{WorkerCount: 8}
-	executor := New[string](cfg)
+	executor := New[string, int](cfg)
 	defer executor.Shutdown()
 
 	workers, pending := executor.Stats()
@@ -175,7 +175,7 @@ func TestKeyedExecutor_Stats(t *testing.T) {
 }
 
 func BenchmarkKeyedExecutor_SingleKey(b *testing.B) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	b.ResetTimer()
@@ -189,7 +189,7 @@ func BenchmarkKeyedExecutor_SingleKey(b *testing.B) {
 }
 
 func BenchmarkKeyedExecutor_MultipleKeys(b *testing.B) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	b.ResetTimer()
@@ -209,7 +209,7 @@ func BenchmarkKeyedExecutor_MultipleKeys(b *testing.B) {
 }
 
 func BenchmarkKeyedExecutor_WithContext(b *testing.B) {
-	executor := New[string]()
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
 	ctx := context.Background()
@@ -225,7 +225,7 @@ func BenchmarkKeyedExecutor_WithContext(b *testing.B) {
 }
 
 func BenchmarkKeyedExecutor_WithError(b *testing.B) {
-	executor := New[string]()
+	executor := New[string, error]()
 	defer executor.Shutdown()
 
 	b.ResetTimer()
@@ -234,5 +234,97 @@ func BenchmarkKeyedExecutor_WithError(b *testing.B) {
 			return nil
 		})
 		<-errCh
+	}
+}
+func TestKeyedExecutor_ExecuteWithResult(t *testing.T) {
+	executor := New[string, int]()
+	defer executor.Shutdown()
+
+	// Test successful result
+	resultChan := executor.ExecuteWithResult("key1", func() (int, error) {
+		return 42, nil
+	})
+
+	result := <-resultChan
+	if result.Err != nil {
+		t.Errorf("Expected no error, got: %v", result.Err)
+	}
+	if result.Value != 42 {
+		t.Errorf("Expected result 42, got: %d", result.Value)
+	}
+
+	// Test with error
+	expectedErr := errors.New("calculation failed")
+	resultChan = executor.ExecuteWithResult("key2", func() (int, error) {
+		return 0, expectedErr
+	})
+
+	result = <-resultChan
+	if result.Err != expectedErr {
+		t.Errorf("Expected error %v, got %v", expectedErr, result.Err)
+	}
+}
+
+func TestKeyedExecutor_ExecuteWithContextResult(t *testing.T) {
+	executor := New[string, int]()
+	defer executor.Shutdown()
+
+	ctx := context.Background()
+
+	// Test successful result with context
+	resultChan := executor.ExecuteWithContextResult("key1", ctx, func(ctx context.Context) (int, error) {
+		return 42, nil
+	})
+
+	result := <-resultChan
+	if result.Err != nil {
+		t.Errorf("Expected no error, got: %v", result.Err)
+	}
+	if result.Value != 42 {
+		t.Errorf("Expected result 42, got: %d", result.Value)
+	}
+
+	// Test with context cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	resultChan = executor.ExecuteWithContextResult("key2", ctx, func(ctx context.Context) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return 100, nil
+	})
+
+	result = <-resultChan
+	if result.Err == nil {
+		t.Error("Expected context cancellation error, got nil")
+	}
+}
+
+func BenchmarkKeyedExecutor_WithResult(b *testing.B) {
+	executor := New[string, int]()
+	defer executor.Shutdown()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resultCh := executor.ExecuteWithResult("result-key", func() (int, error) {
+			return i, nil
+		})
+		<-resultCh
+	}
+}
+
+func BenchmarkKeyedExecutor_WithContextResult(b *testing.B) {
+	executor := New[string, int]()
+	defer executor.Shutdown()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resultCh := executor.ExecuteWithContextResult("ctx-result-key", ctx, func(ctx context.Context) (int, error) {
+			return i, nil
+		})
+		<-resultCh
 	}
 }
