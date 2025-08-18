@@ -3,11 +3,16 @@ package keyedexecutor
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func noop() {
+	time.Sleep(10 * time.Millisecond) // 模拟一些工作
+}
 
 func waitUntil(t *testing.T, cond func() bool, timeout time.Duration) {
 	t.Helper()
@@ -136,8 +141,8 @@ func TestNoParallelOnSameKey(t *testing.T) {
 		e.Execute("same-key", func() {
 			defer wg.Done()
 			if atomic.AddInt32(&inSection, 1) != 1 {
-				errCh <- // 发现并发进入
-				fmt.Errorf("tasks for same key ran in parallel (task %d)", id)
+				// 发现并发进入
+				errCh <- fmt.Errorf("tasks for same key ran in parallel (task %d)", id)
 				return
 			}
 			time.Sleep(50 * time.Millisecond) // 模拟执行
@@ -234,32 +239,158 @@ func TestShutdownWaitsForInFlight(t *testing.T) {
 		})
 	}
 
-	// 等价于等待所有任务完成（Shutdown 内部 wg.Wait）
+	// 并行等待 Shutdown 和任务完成，避免使用 default 引发的竞态
 	done := make(chan struct{})
 	go func() {
 		e.Shutdown()
 		close(done)
 	}()
 
-	// 如果 Shutdown 没有等待，done 会过早返回
+	wgDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(wgDone)
+	}()
+
 	select {
 	case <-done:
-		// 任务还没全完成就返回则失败
-		// 不过为了避免超时波动，这里先等 wg，确认是否真的提前返回
+		// Shutdown 返回了，确保任务也已完成（给一点缓冲时间）
 		select {
-		case <-time.After(10 * time.Millisecond):
-			// 给一点缓冲时间
-		default:
-		}
-		ch := make(chan struct{})
-		go func() { wg.Wait(); close(ch) }()
-		select {
-		case <-ch:
-			// 正常：所有任务已完成
-		default:
+		case <-wgDone:
+			// ok
+		case <-time.After(100 * time.Millisecond):
 			t.Fatal("Shutdown returned before tasks completed")
 		}
+	case <-wgDone:
+		// 任务先完成，则确保 Shutdown 随后也能尽快返回
+		select {
+		case <-done:
+			// ok
+		case <-time.After(1 * time.Second):
+			t.Fatal("Shutdown did not return after tasks completed")
+		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Shutdown did not return in time")
+		t.Fatal("Timeout waiting for shutdown or tasks to complete")
 	}
+}
+
+func BenchmarkPerKey_SingleKey(b *testing.B) {
+	e := New[string, any]()
+	defer e.Shutdown()
+
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.Execute("user-1", func() {
+			noop()
+			wg.Done()
+		})
+	}
+	wg.Wait()
+}
+
+func BenchmarkPerKey_100Keys(b *testing.B) {
+	e := New[string, any]()
+	defer e.Shutdown()
+
+	const keys = 100
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := fmt.Sprintf("u-%d", i%keys)
+		e.Execute(k, func() {
+			noop()
+			wg.Done()
+		})
+	}
+	wg.Wait()
+}
+
+func BenchmarkPerKey_Parallel_100Keys(b *testing.B) {
+	e := New[string, any]()
+	defer e.Shutdown()
+
+	const keys = 100
+	var outstanding int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		local := 0
+		for pb.Next() {
+			local++
+			atomic.AddInt64(&outstanding, 1)
+			k := fmt.Sprintf("u-%d", local%keys)
+			e.Execute(k, func() {
+				noop()
+				atomic.AddInt64(&outstanding, -1)
+			})
+		}
+	})
+
+	// 等待所有已提交任务完成
+	for atomic.LoadInt64(&outstanding) != 0 {
+		runtime.Gosched()
+	}
+}
+
+func BenchmarkPerKey_Parallel_1kKeys(b *testing.B) {
+	e := New[string, any]()
+	defer e.Shutdown()
+
+	const keys = 1000
+	var outstanding int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		local := 0
+		for pb.Next() {
+			local++
+			atomic.AddInt64(&outstanding, 1)
+			k := fmt.Sprintf("u-%d", local%keys)
+			e.Execute(k, func() {
+				// 模拟一点点计算负载，避免纯调度过于乐观
+				x := 0
+				for i := 0; i < 16; i++ {
+					x += i
+				}
+				_ = x
+				atomic.AddInt64(&outstanding, -1)
+			})
+		}
+	})
+
+	for atomic.LoadInt64(&outstanding) != 0 {
+		runtime.Gosched()
+	}
+}
+
+func BenchmarkPerKey_WithResult(b *testing.B) {
+	e := New[string, int]()
+	defer e.Shutdown()
+
+	const keys = 64
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := fmt.Sprintf("u-%d", i%keys)
+		ch := e.ExecuteWithResult(k, func() (int, error) {
+			// 一点点计算
+			x := 0
+			for j := 0; j < 8; j++ {
+				x += j
+			}
+			return x, nil
+		})
+		go func() {
+			<-ch
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }

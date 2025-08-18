@@ -24,7 +24,11 @@ type KeyedExecutor[K comparable, R any] struct {
 	mu       sync.Mutex
 	slots    map[K]*slot // per-key task slots
 	stopChan chan struct{}
-	wg       sync.WaitGroup
+
+	// wg waits for all per-key workers to exit.
+	wg sync.WaitGroup
+	// tasksWG waits for all scheduled tasks to finish Execute().
+	tasksWG sync.WaitGroup
 }
 
 type slot struct {
@@ -192,6 +196,8 @@ func (e *KeyedExecutor[K, R]) scheduleTask(key K, task Task) {
 		e.slots[key] = s
 	}
 	s.queue.PushBack(task)
+	// track pending tasks
+	e.tasksWG.Add(1)
 	// Start a worker if there isn't one already running for this key.
 	if !s.active {
 		s.active = true
@@ -228,14 +234,20 @@ func (e *KeyedExecutor[K, R]) workerLoopForKey(key K, s *slot) {
 		e.mu.Unlock()
 
 		// Execute outside the lock to allow enqueuing new tasks concurrently.
-		task.Execute()
+		func() {
+			defer e.tasksWG.Done()
+			task.Execute()
+		}()
 	}
 }
 
-// Shutdown waits for all currently running per-key workers to finish.
+// Shutdown waits for all tasks to complete and all per-key workers to finish.
 // Pending tasks continue to run to completion. New tasks should not be enqueued after Shutdown.
 func (e *KeyedExecutor[K, R]) Shutdown() {
 	close(e.stopChan)
+	// Wait for all scheduled tasks to finish executing.
+	e.tasksWG.Wait()
+	// Then ensure all workers have exited and slots are cleaned up.
 	e.wg.Wait()
 }
 
