@@ -28,8 +28,12 @@ func TestKeyedExecutor_Execute(t *testing.T) {
 	// Wait for tasks to complete
 	time.Sleep(100 * time.Millisecond)
 
-	if counter != 10 {
-		t.Errorf("Expected counter to be 10, got %d", counter)
+	mu.Lock()
+	finalCounter := counter
+	mu.Unlock()
+	
+	if finalCounter != 10 {
+		t.Errorf("Expected counter to be 10, got %d", finalCounter)
 	}
 }
 
@@ -125,13 +129,12 @@ func TestKeyedExecutor_ConcurrentExecution(t *testing.T) {
 }
 
 func TestKeyedExecutor_Stats(t *testing.T) {
-	cfg := Config{WorkerCount: 8}
-	executor := New[string, int](cfg)
+	executor := New[string, int]()
 	defer executor.Shutdown()
 
-	workers, pending := executor.Stats()
-	if workers != 8 {
-		t.Errorf("Expected 8 workers, got %d", workers)
+	slots, pending := executor.Stats()
+	if slots != 0 {
+		t.Errorf("Expected 0 slots, got %d", slots)
 	}
 	if pending != 0 {
 		t.Errorf("Expected 0 pending tasks, got %d", pending)

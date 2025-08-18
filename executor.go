@@ -1,12 +1,11 @@
 // Package keyedexecutor provides a generic, key-based concurrent task execution framework.
 // Tasks with the same key are executed sequentially, while tasks with different keys can execute concurrently.
-// It is useful for enforcing per-key serialization (e.g., per-user order placement) while maintaining global concurrency.
+// This version assigns a dedicated slot (queue + worker) per key, avoiding cross-key serialization caused by hashing.
 package keyedexecutor
 
 import (
 	"container/list"
 	"context"
-	"hash/fnv"
 	"sync"
 )
 
@@ -19,14 +18,18 @@ type Result[R any] struct {
 
 // KeyedExecutor manages the concurrent execution of tasks partitioned by key.
 // Tasks sharing the same key are executed serially in the order they are submitted.
-// Internally, keys are hashed into a fixed number of buckets, each processed by a dedicated worker goroutine.
+// Internally, each key gets its own slot (queue + worker). The worker drains the queue and
+// exits when the queue becomes empty. New tasks for that key will spawn a new worker on demand.
 type KeyedExecutor[K comparable, R any] struct {
-	mu          sync.Mutex      // protects access to taskQueues
-	taskQueues  []*list.List    // per-bucket task queues
-	workers     []chan struct{} // per-bucket wake-up channels
-	hashBuckets int             // number of hash buckets
-	stopChan    chan struct{}   // signals all workers to shut down
-	wg          sync.WaitGroup  // waits for all workers to complete
+	mu       sync.Mutex
+	slots    map[K]*slot // per-key task slots
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+}
+
+type slot struct {
+	queue  *list.List
+	active bool // whether a worker goroutine is currently running for this slot
 }
 
 // Task represents a unit of executable logic.
@@ -110,43 +113,24 @@ func (t *ContextGenericResultTask[R]) Execute() {
 	close(t.resultC)
 }
 
-// Config contains optional parameters for KeyedExecutor initialization.
-type Config struct {
-	WorkerCount int // number of worker goroutines to spin up (i.e., hash buckets)
-}
+// Config is kept for API compatibility. Currently there are no tunables.
+// Future options could include idle timeouts, caps on active slots, etc.
+type Config struct{}
 
-// DefaultConfig returns the recommended default configuration with 16 workers.
-func DefaultConfig() Config {
-	return Config{WorkerCount: 16}
-}
+// DefaultConfig returns the default configuration.
+func DefaultConfig() Config { return Config{} }
 
-// New creates a new KeyedExecutor instance with optional configuration.
-// If no config is provided, DefaultConfig is used.
-// WorkerCount must be positive, or DefaultConfig will be enforced.
+// New creates a new KeyedExecutor instance.
+// Per-key workers are created on demand and exit when their queue becomes empty.
 func New[K comparable, R any](config ...Config) *KeyedExecutor[K, R] {
-	cfg := DefaultConfig()
+	_ = DefaultConfig()
 	if len(config) > 0 {
-		cfg = config[0]
+		_ = config[0]
 	}
-	if cfg.WorkerCount <= 0 {
-		cfg = DefaultConfig()
+	return &KeyedExecutor[K, R]{
+		slots:    make(map[K]*slot),
+		stopChan: make(chan struct{}),
 	}
-
-	ke := &KeyedExecutor[K, R]{
-		taskQueues:  make([]*list.List, cfg.WorkerCount),
-		workers:     make([]chan struct{}, cfg.WorkerCount),
-		hashBuckets: cfg.WorkerCount,
-		stopChan:    make(chan struct{}),
-	}
-
-	for i := 0; i < cfg.WorkerCount; i++ {
-		ke.taskQueues[i] = list.New()
-		ke.workers[i] = make(chan struct{}, 1)
-		ke.wg.Add(1)
-		go ke.workerLoop(i)
-	}
-
-	return ke
 }
 
 // Execute schedules a simple task (no context, no result) for the given key.
@@ -195,90 +179,75 @@ func (e *KeyedExecutor[K, R]) ExecuteWithContextResult(key K, ctx context.Contex
 	return resultC
 }
 
-// scheduleTask hashes the key to a bucket, enqueues the task, and wakes up the corresponding worker if idle.
+// scheduleTask enqueues the task into the per-key slot, creating a slot and worker if needed.
+// The per-key worker drains tasks serially and exits when the queue is empty.
 func (e *KeyedExecutor[K, R]) scheduleTask(key K, task Task) {
-	bucketIndex := e.hashKey(key)
 	e.mu.Lock()
-	queue := e.taskQueues[bucketIndex]
-	queue.PushBack(task)
-	e.mu.Unlock()
-
-	select {
-	case e.workers[bucketIndex] <- struct{}{}:
-	default: // worker already awake
-	}
-}
-
-// hashKey computes a deterministic hash bucket index from the key.
-func (e *KeyedExecutor[K, R]) hashKey(key K) int {
-	h := fnv.New32a()
-
-	// Simple type assertions for common keys
-	switch k := any(key).(type) {
-	case string:
-		h.Write([]byte(k))
-	case int:
-		var buf [4]byte
-		buf[0] = byte(k)
-		buf[1] = byte(k >> 8)
-		buf[2] = byte(k >> 16)
-		buf[3] = byte(k >> 24)
-		h.Write(buf[:])
-	case int64:
-		var buf [8]byte
-		for i := 0; i < 8; i++ {
-			buf[i] = byte(k >> (8 * i))
+	s := e.slots[key]
+	if s == nil {
+		s = &slot{
+			queue:  list.New(),
+			active: false,
 		}
-		h.Write(buf[:])
-	default:
-		// fallback: use string representation
-		h.Write([]byte(any(key).(string)))
+		e.slots[key] = s
 	}
-
-	return int(h.Sum32()) % e.hashBuckets
+	s.queue.PushBack(task)
+	// Start a worker if there isn't one already running for this key.
+	if !s.active {
+		s.active = true
+		e.wg.Add(1)
+		go e.workerLoopForKey(key, s)
+	}
+	e.mu.Unlock()
 }
 
-// workerLoop is the main processing loop for each bucket worker.
-// It processes tasks serially from the queue until shutdown.
-func (e *KeyedExecutor[K, R]) workerLoop(bucketIndex int) {
+// workerLoopForKey processes tasks for a single key serially.
+// It drains the queue and exits when no more tasks are pending.
+// On exit, it removes the slot from the executor (to free memory) and marks it inactive.
+func (e *KeyedExecutor[K, R]) workerLoopForKey(key K, s *slot) {
 	defer e.wg.Done()
+
 	for {
-		select {
-		case <-e.workers[bucketIndex]: // woken up to process
-		case <-e.stopChan: // global shutdown
+		var task Task
+
+		e.mu.Lock()
+		if s.queue.Len() == 0 {
+			// No more tasks; clean up the slot and exit.
+			// Only delete if the current slot is still the one registered for the key.
+			if curr, ok := e.slots[key]; ok && curr == s {
+				delete(e.slots, key)
+			}
+			// Mark inactive for safety; though slot is removed from map.
+			s.active = false
+			e.mu.Unlock()
 			return
 		}
-		for {
-			e.mu.Lock()
-			queue := e.taskQueues[bucketIndex]
-			if queue.Len() == 0 {
-				e.mu.Unlock()
-				break
-			}
-			elem := queue.Front()
-			task := elem.Value.(Task)
-			queue.Remove(elem)
-			e.mu.Unlock()
-			task.Execute()
-		}
+		elem := s.queue.Front()
+		task = elem.Value.(Task)
+		s.queue.Remove(elem)
+		e.mu.Unlock()
+
+		// Execute outside the lock to allow enqueuing new tasks concurrently.
+		task.Execute()
 	}
 }
 
-// Shutdown stops all worker goroutines and waits for them to exit.
-// Pending tasks may still be executed before workers terminate.
+// Shutdown waits for all currently running per-key workers to finish.
+// Pending tasks continue to run to completion. New tasks should not be enqueued after Shutdown.
 func (e *KeyedExecutor[K, R]) Shutdown() {
 	close(e.stopChan)
 	e.wg.Wait()
 }
 
-// Stats returns the number of buckets and total number of queued tasks across all buckets.
-func (e *KeyedExecutor[K, R]) Stats() (buckets int, pending int) {
+// Stats returns the number of active slots (keys with pending or running tasks)
+// and the total number of queued tasks across all slots.
+func (e *KeyedExecutor[K, R]) Stats() (slots int, pending int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	buckets = e.hashBuckets
-	for _, q := range e.taskQueues {
-		pending += q.Len()
+	slots = len(e.slots)
+	for _, s := range e.slots {
+		pending += s.queue.Len()
 	}
 	return
 }
