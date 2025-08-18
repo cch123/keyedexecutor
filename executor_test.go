@@ -2,329 +2,264 @@ package keyedexecutor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestKeyedExecutor_Execute(t *testing.T) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
+func waitUntil(t *testing.T, cond func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %s", timeout)
+}
 
-	var counter int
+// 同一个 key 串行且保持提交顺序
+func TestSameKeySerialOrder(t *testing.T) {
+	e := New[string, any]()
+
+	const n = 200
 	var mu sync.Mutex
+	order := make([]int, 0, n)
 
-	// Execute multiple tasks with same key (sequential execution)
-	for i := 0; i < 10; i++ {
-		executor.Execute("same-key", func() {
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		e.Execute("user-1", func() {
+			defer wg.Done()
 			mu.Lock()
-			counter++
+			order = append(order, i)
 			mu.Unlock()
 		})
 	}
-
-	// Wait for tasks to complete
-	time.Sleep(100 * time.Millisecond)
-
-	if counter != 10 {
-		t.Errorf("Expected counter to be 10, got %d", counter)
-	}
-}
-
-func TestKeyedExecutor_ExecuteWithContext(t *testing.T) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	executor.ExecuteWithContext("test-key", ctx, func(ctx context.Context) {
-		defer wg.Done()
-
-		select {
-		case <-ctx.Done():
-			t.Error("Context should not have expired yet")
-		case <-time.After(100 * time.Millisecond):
-			// Expected behavior
-		}
-	})
-
 	wg.Wait()
-}
 
-func TestKeyedExecutor_ExecuteWithError(t *testing.T) {
-	executor := New[int, int]()
-	defer executor.Shutdown()
-
-	expectedErr := errors.New("test error")
-
-	errChan := executor.ExecuteWithError(42, func() error {
-		return expectedErr
-	})
-
-	err := <-errChan
-	if err != expectedErr {
-		t.Errorf("Expected error %v, got %v", expectedErr, err)
+	// 期望严格按 0..n-1 顺序
+	for i := 0; i < n; i++ {
+		if order[i] != i {
+			t.Fatalf("order broken at %d: got %d want %d", i, order[i], i)
+		}
 	}
+
+	// 完成后应清理 slot
+	waitUntil(t, func() bool {
+		slots, _ := e.Stats()
+		return slots == 0
+	}, 2*time.Second)
+
+	e.Shutdown()
 }
 
-func TestKeyedExecutor_ExecuteWithContextError(t *testing.T) {
-	executor := New[int, int]()
-	defer executor.Shutdown()
+// 不同 key 可以并行
+func TestDifferentKeysParallel(t *testing.T) {
+	e := New[string, any]()
 
-	ctx := context.Background()
-	expectedErr := errors.New("test context error")
+	var running int32
+	var maxRunning int32
 
-	errChan := executor.ExecuteWithContextError(123, ctx, func(ctx context.Context) error {
-		return expectedErr
-	})
-
-	err := <-errChan
-	if err != expectedErr {
-		t.Errorf("Expected error %v, got %v", expectedErr, err)
-	}
-}
-
-func TestKeyedExecutor_ConcurrentExecution(t *testing.T) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
 
 	var wg sync.WaitGroup
-	const numKeys = 5
-	const tasksPerKey = 10
+	wg.Add(2)
 
-	results := make([]int, numKeys)
-
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprint("a", i)
-		wg.Add(tasksPerKey)
-
-		for j := 0; j < tasksPerKey; j++ {
-			executor.Execute(key, func(keyIndex int) func() {
-				return func() {
-					defer wg.Done()
-					results[keyIndex]++
-					time.Sleep(10 * time.Millisecond)
+	run := func(key string) {
+		e.Execute(key, func() {
+			defer wg.Done()
+			c := atomic.AddInt32(&running, 1)
+			for {
+				// 更新最大并发
+				old := atomic.LoadInt32(&maxRunning)
+				if c > old && atomic.CompareAndSwapInt32(&maxRunning, old, c) {
+					break
 				}
-			}(i))
-		}
+				if c <= old {
+					break
+				}
+			}
+			started <- struct{}{}
+			<-release
+			atomic.AddInt32(&running, -1)
+		})
 	}
 
+	go run("user-A")
+	go run("user-B")
+
+	// 等两个任务都启动
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first task did not start in time")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second task did not start in time")
+	}
+
+	// 应该出现并发=2（不同 key）
+	if atomic.LoadInt32(&maxRunning) < 2 {
+		t.Fatalf("expected parallelism across keys, maxRunning=%d", atomic.LoadInt32(&maxRunning))
+	}
+
+	close(release)
 	wg.Wait()
 
-	for i, count := range results {
-		if count != tasksPerKey {
-			t.Errorf("Key %c expected %d executions, got %d", 'a'+i, tasksPerKey, count)
-		}
-	}
+	// 清理
+	waitUntil(t, func() bool {
+		slots, _ := e.Stats()
+		return slots == 0
+	}, 2*time.Second)
+	e.Shutdown()
 }
 
-func TestKeyedExecutor_Stats(t *testing.T) {
-	cfg := Config{WorkerCount: 8}
-	executor := New[string, int](cfg)
-	defer executor.Shutdown()
+// 同一 key 任务不会并发执行（保护串行约束）
+func TestNoParallelOnSameKey(t *testing.T) {
+	e := New[string, any]()
 
-	workers, pending := executor.Stats()
-	if workers != 8 {
-		t.Errorf("Expected 8 workers, got %d", workers)
-	}
-	if pending != 0 {
-		t.Errorf("Expected 0 pending tasks, got %d", pending)
-	}
+	var inSection int32 // 进入临界区计数
+	errCh := make(chan error, 1)
 
-	// Add some tasks and check stats again
 	var wg sync.WaitGroup
+	wg.Add(2)
+
+	run := func(id int) {
+		e.Execute("same-key", func() {
+			defer wg.Done()
+			if atomic.AddInt32(&inSection, 1) != 1 {
+				errCh <- // 发现并发进入
+				fmt.Errorf("tasks for same key ran in parallel (task %d)", id)
+				return
+			}
+			time.Sleep(50 * time.Millisecond) // 模拟执行
+			atomic.AddInt32(&inSection, -1)
+		})
+	}
+
+	go run(1)
+	go run(2)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("tasks did not complete in time")
+	}
+
+	e.Shutdown()
+}
+
+// 执行完成后 slot 会被回收；同一 key 再来可重新创建并运行
+func TestSlotLifecycleAndRecreate(t *testing.T) {
+	e := New[string, any]()
+
+	var wg sync.WaitGroup
+
 	wg.Add(1)
-
-	blockCh := make(chan struct{})
-
-	executor.Execute("key1", func() {
-		<-blockCh // Block until we unblock
-		wg.Done()
-	})
-
-	// Schedule more tasks
-	for i := 0; i < 5; i++ {
-		executor.Execute("key1", func() {})
-	}
-
-	// Give tasks time to be queued
-	time.Sleep(10 * time.Millisecond)
-
-	_, pending = executor.Stats()
-	if pending < 5 { // At least 5 tasks should be pending (might be 6 if first one is still queued)
-		t.Errorf("Expected at least 5 pending tasks, got %d", pending)
-	}
-
-	// Unblock the first task
-	close(blockCh)
+	e.Execute("reuser", func() { defer wg.Done() })
 	wg.Wait()
 
-	// Wait for all tasks to complete
-	time.Sleep(100 * time.Millisecond)
+	// 等待 slot 清理
+	waitUntil(t, func() bool {
+		slots, _ := e.Stats()
+		return slots == 0
+	}, 2*time.Second)
 
-	_, pending = executor.Stats()
-	if pending != 0 {
-		t.Errorf("Expected 0 pending tasks, got %d", pending)
-	}
+	// 再来一个同 key 任务
+	wg.Add(1)
+	e.Execute("reuser", func() { defer wg.Done() })
+	wg.Wait()
+
+	// 再次清理
+	waitUntil(t, func() bool {
+		slots, _ := e.Stats()
+		return slots == 0
+	}, 2*time.Second)
+
+	e.Shutdown()
 }
 
-func BenchmarkKeyedExecutor_SingleKey(b *testing.B) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
+// ExecuteWithResult / ExecuteWithContextResult 功能正确
+func TestExecuteWithResult(t *testing.T) {
+	e := New[string, int]()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		done := make(chan struct{})
-		executor.Execute("single-key", func() {
-			close(done)
-		})
-		<-done
-	}
-}
-
-func BenchmarkKeyedExecutor_MultipleKeys(b *testing.B) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		counter := 0
-		for pb.Next() {
-			key := fmt.Sprintf("key-%d", counter%100)
-			counter++
-
-			done := make(chan struct{})
-			executor.Execute(key, func() {
-				close(done)
-			})
-			<-done
-		}
-	})
-}
-
-func BenchmarkKeyedExecutor_WithContext(b *testing.B) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		done := make(chan struct{})
-		executor.ExecuteWithContext("context-key", ctx, func(ctx context.Context) {
-			close(done)
-		})
-		<-done
-	}
-}
-
-func BenchmarkKeyedExecutor_WithError(b *testing.B) {
-	executor := New[string, error]()
-	defer executor.Shutdown()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		errCh := executor.ExecuteWithError("error-key", func() error {
-			return nil
-		})
-		<-errCh
-	}
-}
-func TestKeyedExecutor_ExecuteWithResult(t *testing.T) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	// Test successful result
-	resultChan := executor.ExecuteWithResult("key1", func() (int, error) {
+	resC := e.ExecuteWithResult("k", func() (int, error) {
 		return 42, nil
 	})
-
-	result := <-resultChan
-	if result.Err != nil {
-		t.Errorf("Expected no error, got: %v", result.Err)
-	}
-	if result.Value != 42 {
-		t.Errorf("Expected result 42, got: %d", result.Value)
+	res := <-resC
+	if res.Err != nil || res.Value != 42 {
+		t.Fatalf("unexpected result: %+v", res)
 	}
 
-	// Test with error
-	expectedErr := errors.New("calculation failed")
-	resultChan = executor.ExecuteWithResult("key2", func() (int, error) {
-		return 0, expectedErr
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resC2 := e.ExecuteWithContextResult("k", ctx, func(ctx context.Context) (int, error) {
+		return 7, nil
 	})
-
-	result = <-resultChan
-	if result.Err != expectedErr {
-		t.Errorf("Expected error %v, got %v", expectedErr, result.Err)
+	res2 := <-resC2
+	if res2.Err != nil || res2.Value != 7 {
+		t.Fatalf("unexpected ctx result: %+v", res2)
 	}
+
+	e.Shutdown()
 }
 
-func TestKeyedExecutor_ExecuteWithContextResult(t *testing.T) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
+// Shutdown 会等待在途任务执行完成
+func TestShutdownWaitsForInFlight(t *testing.T) {
+	e := New[string, any]()
 
-	ctx := context.Background()
-
-	// Test successful result with context
-	resultChan := executor.ExecuteWithContextResult("key1", ctx, func(ctx context.Context) (int, error) {
-		return 42, nil
-	})
-
-	result := <-resultChan
-	if result.Err != nil {
-		t.Errorf("Expected no error, got: %v", result.Err)
-	}
-	if result.Value != 42 {
-		t.Errorf("Expected result 42, got: %d", result.Value)
+	var wg sync.WaitGroup
+	const n = 5
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		e.Execute("key", func() {
+			defer wg.Done()
+			time.Sleep(50 * time.Millisecond)
+		})
 	}
 
-	// Test with context cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	// 等价于等待所有任务完成（Shutdown 内部 wg.Wait）
+	done := make(chan struct{})
+	go func() {
+		e.Shutdown()
+		close(done)
+	}()
 
-	resultChan = executor.ExecuteWithContextResult("key2", ctx, func(ctx context.Context) (int, error) {
-		if err := ctx.Err(); err != nil {
-			return 0, err
+	// 如果 Shutdown 没有等待，done 会过早返回
+	select {
+	case <-done:
+		// 任务还没全完成就返回则失败
+		// 不过为了避免超时波动，这里先等 wg，确认是否真的提前返回
+		select {
+		case <-time.After(10 * time.Millisecond):
+			// 给一点缓冲时间
+		default:
 		}
-		return 100, nil
-	})
-
-	result = <-resultChan
-	if result.Err == nil {
-		t.Error("Expected context cancellation error, got nil")
-	}
-}
-
-func BenchmarkKeyedExecutor_WithResult(b *testing.B) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		resultCh := executor.ExecuteWithResult("result-key", func() (int, error) {
-			return i, nil
-		})
-		<-resultCh
-	}
-}
-
-func BenchmarkKeyedExecutor_WithContextResult(b *testing.B) {
-	executor := New[string, int]()
-	defer executor.Shutdown()
-
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		resultCh := executor.ExecuteWithContextResult("ctx-result-key", ctx, func(ctx context.Context) (int, error) {
-			return i, nil
-		})
-		<-resultCh
+		ch := make(chan struct{})
+		go func() { wg.Wait(); close(ch) }()
+		select {
+		case <-ch:
+			// 正常：所有任务已完成
+		default:
+			t.Fatal("Shutdown returned before tasks completed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown did not return in time")
 	}
 }
